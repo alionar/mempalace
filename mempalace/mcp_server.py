@@ -1112,8 +1112,14 @@ def tool_list_rooms(wing: str = None):
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
     try:
-        where = {"wing": wing} if wing else None
-        all_meta = _fetch_all_metadata(col, where=where)
+        # Use the cached unfiltered set and filter in Python. The where-filtered
+        # path runs _fetch_all_metadata's offset loop, which is O(M^2) on qdrant
+        # because each col.get re-scrolls the whole wing subset. With one wing
+        # holding most drawers (85K of 158K here) that stalled list_rooms for
+        # minutes. One in-memory pass over the cached full set is sub-second.
+        all_meta = _get_cached_metadata(col)
+        if wing:
+            all_meta = [m for m in all_meta if (m or {}).get("wing") == wing]
         for m in all_meta:
             m = m or {}
             r = m.get("room", "unknown")
