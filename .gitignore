@@ -40,3 +40,4 @@ venv/
 .review-logs
 .serena/.gitignore
 .serena/project.yml
+.serena/project.local.yml
