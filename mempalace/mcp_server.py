@@ -923,6 +923,24 @@ def _get_cached_metadata(col, where=None):
     return result
 
 
+def _facet_histogram(col, field, where=None):
+    """Server-side value->count histogram via the backend facet capability.
+
+    Returns None when the backend cannot facet (non-qdrant backend, a qdrant
+    collection with no payload index on the field, or a where clause qdrant
+    cannot push down), so callers fall back to the metadata-scan path. When it
+    returns a dict the output matches the scan path, including the "unknown"
+    bucket for drawers missing the field.
+    """
+    if not getattr(col, "supports_facets", False):
+        return None
+    try:
+        return col.facet(field, where=where)
+    except Exception:
+        logger.exception("facet histogram failed; falling back to metadata scan")
+        return None
+
+
 def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     """Validate optional wing/room-style filters."""
     if value is None or not value.strip():
@@ -1035,13 +1053,19 @@ def tool_status():
         "backend": _selected_backend_name(),
     }
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-            rooms[r] = rooms.get(r, 0) + 1
+        fw = _facet_histogram(col, "wing")
+        fr = _facet_histogram(col, "room")
+        if fw is not None and fr is not None:
+            wings.update(fw)
+            rooms.update(fr)
+        else:
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                r = m.get("room", "unknown")
+                wings[w] = wings.get(w, 0) + 1
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_status metadata fetch failed")
         result["error"] = str(e)
@@ -1089,11 +1113,15 @@ def tool_list_wings():
     wings = {}
     result = {"wings": wings}
     try:
-        all_meta = _get_cached_metadata(col)
-        for m in all_meta:
-            m = m or {}
-            w = m.get("wing", "unknown")
-            wings[w] = wings.get(w, 0) + 1
+        fw = _facet_histogram(col, "wing")
+        if fw is not None:
+            wings.update(fw)
+        else:
+            all_meta = _get_cached_metadata(col)
+            for m in all_meta:
+                m = m or {}
+                w = m.get("wing", "unknown")
+                wings[w] = wings.get(w, 0) + 1
     except Exception as e:
         logger.exception("tool_list_wings metadata fetch failed")
         result["error"] = str(e)
@@ -1112,18 +1140,22 @@ def tool_list_rooms(wing: str = None):
     rooms = {}
     result = {"wing": wing or "all", "rooms": rooms}
     try:
-        # Use the cached unfiltered set and filter in Python. The where-filtered
-        # path runs _fetch_all_metadata's offset loop, which is O(M^2) on qdrant
-        # because each col.get re-scrolls the whole wing subset. With one wing
-        # holding most drawers (85K of 158K here) that stalled list_rooms for
-        # minutes. One in-memory pass over the cached full set is sub-second.
-        all_meta = _get_cached_metadata(col)
-        if wing:
-            all_meta = [m for m in all_meta if (m or {}).get("wing") == wing]
-        for m in all_meta:
-            m = m or {}
-            r = m.get("room", "unknown")
-            rooms[r] = rooms.get(r, 0) + 1
+        # Prefer the server-side facet histogram (qdrant). Falls back to the
+        # cached unfiltered set filtered in Python. The old where-filtered
+        # _fetch_all_metadata offset loop was O(M^2) on qdrant because each
+        # col.get re-scrolls the whole wing subset; with one wing holding most
+        # drawers (85K of 158K here) that stalled list_rooms for minutes.
+        fr = _facet_histogram(col, "room", where={"wing": wing} if wing else None)
+        if fr is not None:
+            rooms.update(fr)
+        else:
+            all_meta = _get_cached_metadata(col)
+            if wing:
+                all_meta = [m for m in all_meta if (m or {}).get("wing") == wing]
+            for m in all_meta:
+                m = m or {}
+                r = m.get("room", "unknown")
+                rooms[r] = rooms.get(r, 0) + 1
     except Exception as e:
         logger.exception("tool_list_rooms metadata fetch failed")
         result["error"] = str(e)

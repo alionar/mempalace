@@ -519,14 +519,36 @@ class _QdrantRESTClient:
             body=selector,
         )
 
-    def count_points(self, collection: str) -> int:
+    def count_points(self, collection: str, *, qdrant_filter: Optional[dict] = None) -> int:
+        body: dict[str, Any] = {"exact": True}
+        if qdrant_filter:
+            body["filter"] = qdrant_filter
         response = self.request(
             "POST",
             f"/collections/{urlparse.quote(collection, safe='')}/points/count",
-            body={"exact": True},
+            body=body,
         )
         result = response.get("result") or {}
         return int(result.get("count") or 0)
+
+    def facet_counts(
+        self,
+        collection: str,
+        key: str,
+        *,
+        qdrant_filter: Optional[dict] = None,
+        limit: int = 1000,
+    ) -> dict:
+        body: dict[str, Any] = {"key": key, "limit": int(limit), "exact": True}
+        if qdrant_filter:
+            body["filter"] = qdrant_filter
+        response = self.request(
+            "POST",
+            f"/collections/{urlparse.quote(collection, safe='')}/facet",
+            body=body,
+        )
+        hits = (response.get("result") or {}).get("hits") or []
+        return {hit["value"]: int(hit["count"]) for hit in hits}
 
     def delete_collection(self, collection: str) -> None:
         self.request("DELETE", f"/collections/{urlparse.quote(collection, safe='')}")
@@ -695,6 +717,16 @@ class QdrantCollection(BaseCollection):
                 self._client.create_collection(self._remote_collection, dimension)
                 self._client.create_payload_index(
                     self._remote_collection, _PAYLOAD_DOCUMENT, "text"
+                )
+                # Keyword indexes on wing/room so status/list_wings/list_rooms can
+                # compute their count histograms via the server-side facet API
+                # instead of scrolling every payload. create_payload_index is
+                # idempotent (swallows 400/409), so this is safe to call always.
+                self._client.create_payload_index(
+                    self._remote_collection, f"{_PAYLOAD_METADATA}.wing", "keyword"
+                )
+                self._client.create_payload_index(
+                    self._remote_collection, f"{_PAYLOAD_METADATA}.room", "keyword"
                 )
                 self._known_dimension = dimension
                 return
@@ -1021,6 +1053,46 @@ class QdrantCollection(BaseCollection):
                 raise CollectionNotInitializedError(self._collection_name)
             return 0
         return self._client.count_points(self._remote_collection)
+
+    # Marks this backend as able to compute count histograms server-side.
+    # Callers check getattr(col, "supports_facets", False) and fall back to a
+    # metadata scan when it is absent (other backends) or when facet returns None.
+    supports_facets = True
+
+    def facet(self, field: str, where: Optional[dict] = None) -> Optional[dict]:
+        """Server-side value->count histogram for a metadata field.
+
+        Returns a {value: count} dict matching the metadata-scan path, including
+        an "unknown" bucket reconciled from points that lack the field so totals
+        equal count(). Returns None when faceting cannot be used, namely a where
+        clause qdrant cannot push down or a collection with no payload index on
+        the field, so callers fall back to the scan path.
+        """
+        _validate_where(where)
+        if where is not None and _requires_local_filter(where):
+            return None
+        self._ensure_open()
+        if not self._remote_exists():
+            if self._marker_exists():
+                raise CollectionNotInitializedError(self._collection_name)
+            return {}
+        q_filter = _qdrant_filter(where)
+        try:
+            counts = self._client.facet_counts(
+                self._remote_collection,
+                f"{_PAYLOAD_METADATA}.{field}",
+                qdrant_filter=q_filter,
+            )
+        except _QdrantHTTPError as exc:
+            if exc.status == 400:
+                logger.debug("Qdrant facet unavailable (no index?): %s", exc)
+                return None
+            raise
+        total = self._client.count_points(self._remote_collection, qdrant_filter=q_filter)
+        missing = total - sum(counts.values())
+        if missing > 0:
+            counts["unknown"] = counts.get("unknown", 0) + missing
+        return counts
 
     def lexical_search(self, *, query: str, n_results: int = 10, where: Optional[dict] = None):
         _validate_where(where)
