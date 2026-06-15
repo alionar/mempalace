@@ -871,8 +871,21 @@ def _safe_meta(meta):
 
 
 def _fetch_all_metadata(col, where=None):
-    """Paginate col.get() to avoid the 10K silent truncation limit."""
+    """Paginate col.get() to avoid the 10K silent truncation limit.
+
+    Fast path (unfiltered): one unbounded get() returns the full set on
+    backends whose get() scrolls the whole collection (qdrant, pgvector). On
+    those backends the offset-loop below is O(N^2) because each get() re-scans
+    every point, so a 158K-drawer palace made status/list_wings take ~12 min
+    and hung the server. Chroma truncates at ~10K; when the single call comes
+    back short of total we fall through to the paginated path unchanged.
+    """
     total = col.count()
+    if where is None:
+        first = col.get(include=["metadatas"])
+        metas = first["metadatas"]
+        if metas and len(metas) >= total:
+            return metas
     all_meta = []
     offset = 0
     while offset < total:
